@@ -1,4 +1,3 @@
-
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +15,7 @@ use super::var::{Var};
 ///
 /// the log is optional and initially None because there is
 /// only a log inside of a STM computation
-thread_local!(static LOG: RefCell<Option<Log>> = RefCell::new(None));
+thread_local!(static LOG_ACQUIRED: RefCell<bool> = RefCell::new(false));
 
 
 /// a control block for a currently running STM instance
@@ -127,28 +126,28 @@ pub enum StmResult<T> {
 /// # }
 /// ```
 
-pub fn retry() -> STM<'static, ()> {
-    STM::new(|| StmResult::Retry)
+pub fn retry() -> STM<'static, 'static, ()> {
+    STM::new(|_| StmResult::Retry)
 }
 
 /// type synonym for the inner of a STM calculation
-type StmFunction<'a, T> = Fn() -> StmResult<T> + 'a;
+type StmFunction<'a, 'b, T> = Fn(&mut Log<'b>) -> StmResult<T> + 'a;
 
 /// class representing a STM computation
-pub struct STM<'a, T>
+pub struct STM<'a, 'b, T>
 {
     /// STM uses a boxed closure internally
-    intern: Box<Fn() -> StmResult<T> + 'a>
+    intern: Box<StmFunction<'a, 'b, T>>
 }
 
-impl<'a, T: 'a> STM<'a, T> {
+impl<'a, 'b, T: 'a> STM<'a, 'b, T> {
 
     /// create a new STM calculation from a closure
-    pub fn new<F>(func: F) -> STM<'a, T>
-        where F: Fn() -> StmResult<T> + 'a
+    pub fn new<F>(func: F) -> STM<'a, 'b, T>
+        where F: Fn(&mut Log<'b>) -> StmResult<T> + 'a
     {
         STM {
-            intern: Box::new(func) as Box<StmFunction<'a, T>>,
+            intern: Box::new(func) as Box<StmFunction<'a, 'b, T>>,
         }
     }
 
@@ -158,102 +157,96 @@ impl<'a, T: 'a> STM<'a, T> {
     /// the log and retry the computation until it has succeeded
     ///
     /// internal use only
-    pub fn intern_run(&self) -> StmResult<T> {
+    pub fn intern_run(&self, log: &mut Log<'b>) -> StmResult<T> {
         // can't call directly because rust assumes 
         // self.intern() to be a method call
-        (self.intern)()
+        (self.intern)(log)
     }
 
 
     /// write the log back to the variables
     ///
     /// return true for success and false if a read var has changed
-    fn log_writeback(&self) -> bool {
+    fn log_writeback(&self, log: &mut Log<'b>) -> bool {
         // use two phase locking for safely writing data back to the vars
-        with_log(|log| {
 
-            // first phase: acquire locks
-            // check for correctness of the values and perform
-            // an early return if something is not consistent
-            
+        // first phase: acquire locks
+        // check for correctness of the values and perform
+        // an early return if something is not consistent
+        
+        // created arrays for storing the locks
+        
+        // vector of locks
+        let mut read_vec = Vec::new();
 
-            // created arrays for storing the locks
-            
-            // vector of locks
-            let mut read_vec = Vec::new();
+        // vector of tuple (variable, value, lock)
+        let mut write_vec = Vec::new();
 
-            // vector of tuple (variable, value, lock)
-            let mut write_vec = Vec::new();
+        for (var, value) in &log.vars {
+            // lock the variable and read the value
+            let current_value =
+                match value.write {
+                Some(ref written) => {
+                    // take write lock
+                    let lock = var.value.write().unwrap();
+                    // get the current value
+                    let current_value = lock.clone();
+                    // add all data to the vector
+                    write_vec.push((var, written.clone(), lock));
+                    // return the current value
+                    current_value
+                }
+                _ => {
+                    // take a read lock
+                    let lock = var.value.read().unwrap();
+                    // take the current value
+                    let current_value = lock.clone();
+                    read_vec.push(lock);
+                    current_value
+                }
+            };
 
-            for (var, value) in &log.vars {
-                // lock the variable and read the value
-                let current_value =
-                    match value.write {
-                    Some(ref written) => {
-                        // take write lock
-                        let lock = var.value.write().unwrap();
-                        // get the current value
-                        let current_value = lock.clone();
-                        // add all data to the vector
-                        write_vec.push((var, written.clone(), lock));
-                        // return the current value
-                        current_value
-                    }
-                    _ => {
-                        // take a read lock
-                        let lock = var.value.read().unwrap();
-                        // take the current value
-                        let current_value = lock.clone();
-                        read_vec.push(lock);
-                        current_value
-                    }
-                };
-
-                // if the value was read then compare
-                if let Some(ref original) = value.read {
-                    // if the current value is no longer that
-                    // when the computation started then abort commit
-                    if !same_address(&current_value, original) {
-                        return false;
-                    }
+            // if the value was read then compare
+            if let Some(ref original) = value.read {
+                // if the current value is no longer that
+                // when the computation started then abort commit
+                if !same_address(&current_value, original) {
+                    return false;
                 }
             }
+        }
 
-            // second phase: write back and release
+        // second phase: write back and release
 
-            // release the reads first because they are faster
-            mem::drop(read_vec);
+        // release the reads first because they are faster
+        mem::drop(read_vec);
 
 
-            for (var, value, mut lock) in write_vec {
-                // commit value
-                *lock = value;
+        for (var, value, mut lock) in write_vec {
+            // commit value
+            *lock = value;
 
-                // unblock all threads waiting for it
-                var.wake_all();
-            }
+            // unblock all threads waiting for it
+            var.wake_all();
+        }
 
-            // commit succeded
-            true
-        })
+        // commit succeded
+        true
     }
 
 
     /// run a STM computation atomically
     pub fn atomically(&self) -> T {
-        // create a log guard for initializing and cleaning up
-        // the log
-        let _log_guard = LogGuard::new();
+        use self::StmResult::*;
 
-        // loop until success
+        let log = &mut LogGuard::new().log;
+
         loop {
-            use self::StmResult::*;
-
             // run the computation
-            match self.intern_run() {
+            match self.intern_run(log) {
                 // on success exit loop
                 Success(t)  => {
-                    if self.log_writeback() {
+                    if self.log_writeback(log) {
                         return t;
                     }
                 }
@@ -267,46 +260,42 @@ impl<'a, T: 'a> STM<'a, T> {
                     let ctrl = Arc::new(StmControlBlock::new());
 
                     // access the log to get all used variables
-                    with_log(|log| {
-                        let blocking = log.vars.iter()
-                            // take only read vars
-                            .filter(|a| a.1.read.is_some())
-                            // wait for all
-                            .inspect(|a| {
-                                a.0.wait(ctrl.clone());
-                            })
-                            // check if all still contain the same data
-                            .all(|(ref var, value)| {
-                                let guard = var.value.read().unwrap();
-                                let newval = &*guard;
-                                let oldval = value.read.as_ref().unwrap();
-                                same_address(oldval, &newval)
-                            });
+                    let blocking = log.vars.iter()
+                        // take only read vars
+                        .filter(|a| a.1.read.is_some())
+                        // wait for all
+                        .inspect(|a| {
+                            a.0.wait(ctrl.clone());
+                        })
+                        // check if all still contain the same data
+                        .all(|(ref var, value)| {
+                            let guard = var.value.read().unwrap();
+                            let newval = &*guard;
+                            let oldval = value.read.as_ref().unwrap();
+                            same_address(oldval, &newval)
+                        });
 
-                        // if no var has changed then block
-                        if blocking { 
-                            // propably wait until one var has changed
-                            ctrl.wait();
-                        }
+                    // if no var has changed then block
+                    if blocking { 
+                        // propably wait until one var has changed
+                        ctrl.wait();
+                    }
 
-                        // let others know that ctrl is dead
-                        // it does not matter if we set too many
-                        // to dead since it may slightly reduce performance
-                        // but not break the semantics
-                        for (var, value) in &log.vars {
-                            if value.read.is_some() {
-                                var.set_dead();
-                            }
+                    // let others know that ctrl is dead
+                    // it does not matter if we set too many
+                    // to dead since it may slightly reduce performance
+                    // but not break the semantics
+                    for (var, value) in &log.vars {
+                        if value.read.is_some() {
+                            var.set_dead();
                         }
-                    });
+                    }
                 }
             }
 
             // clear log before retrying computation
-            with_log(Log::clear);
+            log.clear();
         }
-
-        // log_guard removes access
     }
 
 
@@ -322,15 +311,15 @@ impl<'a, T: 'a> STM<'a, T> {
     ///
     /// if both call retry then the thread will block until any
     /// of the vars that were read in one of the both branches changes
-    pub fn or(self, other: STM<'a, T>) -> STM<'a, T> {
-        let func = move || {
+    pub fn or<'c>(&'c self, other: &'c STM<'a, 'b, T>) -> STM<'c, 'b, T> {
+        let func = move |log: &mut Log<'b>| {
             use self::StmResult::*;
 
             // create a backup of the log
-            let backup = with_log(|log| log.clone());
+            let backup = log.clone();
 
             // run the first computation
-            let s = self.intern_run();
+            let s = self.intern_run(log);
             
             match s {
                 // return success and failure
@@ -339,14 +328,14 @@ impl<'a, T: 'a> STM<'a, T> {
                 // run other on retry
                 Retry           => {
                     // use backup of log
-                    let old_log = with_log(|log| mem::replace(log, backup));
+                    let old_log = mem::replace(log, backup);
                     // run other
-                    let o = other.intern_run();
+                    let o = other.intern_run(log);
 
                     // if both called retry then exit
                     if let Retry = o {
                         // combine both logs so that all reads are considered
-                        with_log(|log| log.combine_after_retry(old_log));
+                        log.combine_after_retry(old_log);
                     }
                     o
                 }
@@ -365,10 +354,10 @@ impl<'a, T: 'a> STM<'a, T> {
     ///     stm_call!(first);
     ///     stm_call!(second)
     /// });
-    pub fn and<R: 'a>(self, other: STM<'a, R>) -> STM<'a, R> {
-        STM::new(move || StmResult::Success({
-            stm_call!(self);
-            stm_call!(other)
+    pub fn and<'c, R: 'a>(&'c self, other: &'c STM<'a, 'b, R>) -> STM<'c, 'b, R> {
+        STM::new(move |log| StmResult::Success({
+            stm_call!(log, self);
+            stm_call!(log, other)
         }))
     }
 
@@ -382,28 +371,14 @@ impl<'a, T: 'a> STM<'a, T> {
     ///     let x = stm_call!(first);
     ///     stm_call!(second(x))
     /// });
-    pub fn and_then<F: 'a, R: 'a>(self, f: F) -> STM<'a, R>
-        where   F: Fn(T) -> STM<'a, R>,
+    pub fn and_then<'c, F: 'c, R: 'a>(&'c self, f: F) -> STM<'c, 'b, R>
+        where   F: Fn(T) -> STM<'a, 'b, R>,
     {
-        STM::new(move || StmResult::Success({
-            let x = stm_call!(self);
-            stm_call!(f(x))
+        STM::new(move |log| StmResult::Success({
+            let x = stm_call!(log, self);
+            stm_call!(log, f(x))
         }))
     }
-}
-
-
-/// apply a function f to the log and return the result
-///
-/// will panic when called from outside of a STM computation
-pub fn with_log<F, R>(f: F) -> R
-    where F: FnOnce(&mut Log) -> R
-{
-    LOG.with(|cell| {
-        let mut inner = cell.borrow_mut();
-        let mut inner = inner.as_mut().expect("with_log called out of STM");
-        f(&mut inner)
-    })
 }
 
 
@@ -425,45 +400,38 @@ fn same_address<T: ?Sized>(a: &Arc<T>, b: &Arc<T>) -> bool {
 ///
 /// don't use nested STM computations
 #[must_use]
-struct LogGuard;
+struct LogGuard<'a> {
+    log: Log<'a>
+}
 
-impl LogGuard {
-    pub fn new() -> LogGuard {
+impl<'a> LogGuard<'a> {
+    pub fn new() -> LogGuard<'a> {
         // init log
-        LOG.with(|cell| {
+        LOG_ACQUIRED.with(|cell| {
             let mut inner = cell.borrow_mut();
 
             // ensure that there is just one STM at a time
-            assert!(inner.is_none(), "STM: already in atomic operation");
+            assert!(!*inner, "STM: already in atomic operation");
 
             // set log
-            *inner = Some(Log::new());
+            *inner = true
         });
-        LogGuard
+        LogGuard { log: Log::new() }
     }
 }
 
-impl Drop for LogGuard {
+impl<'a> Drop for LogGuard<'a> {
     fn drop(&mut self) {
         // delete log after usage
-        LOG.with(|cell| {
+        LOG_ACQUIRED.with(|cell| {
             let mut inner = cell.borrow_mut();
             // ensure that the inner is present
-            debug_assert!(inner.is_some());
+            debug_assert!(*inner);
 
             // remove log
-            *inner = None;
+            *inner = false;
         });
     }
-}
-
-
-
-#[test]
-#[should_panic]
-// call with_log when it is not initialized
-fn test_with_log_no_stm() {
-    with_log(|_| ());
 }
 
 #[test]
@@ -474,16 +442,18 @@ fn test_log_guard() {
 
 #[test]
 fn test_read_var() {
-    let _guard = LogGuard::new();
     let var = Var::new(vec![1,2]);
-    let x = var.read();
+    let x = {
+        let mut guard = LogGuard::new();
+        var.read(&mut guard.log)
+    };
     
     assert_eq!(x, [1,2]);
 }
 
 #[test]
 fn test_stm_simple() {
-    let stm = STM::new(|| StmResult::Success(42));
+    let stm = STM::new(|_| StmResult::Success(42));
     let x = stm.atomically();
     assert_eq!(x, 42);
 }
@@ -493,8 +463,8 @@ fn test_stm_simple() {
 fn test_stm_read() {
     let read = Var::new(42);
 
-    let stm = STM::new(move || {
-        let r = read.read();
+    let stm = STM::new(|log| {
+        let r = read.read(log);
         StmResult::Success(r)
     });
     let x = stm.atomically();
@@ -506,9 +476,8 @@ fn test_stm_read() {
 fn test_stm_write() {
     let write = Var::new(42);
 
-    let writecp = write.clone();
-    let stm = STM::new(move || {
-        writecp.write(0);
+    let stm = STM::new(|log| {
+        write.write(log, 0);
         StmResult::Success(())
     });
     let _ = stm.atomically();
@@ -521,10 +490,9 @@ fn test_stm_copy() {
     let read = Var::new(42);
     let write = Var::new(0);
 
-    let writecp = write.clone();
-    let stm = STM::new(move || {
-        let r = read.read();
-        writecp.write(r);
+    let stm = STM::new(|log| {
+        let r = read.read(log);
+        write.write(log, r);
         StmResult::Success(())
     });
     stm.atomically();

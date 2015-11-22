@@ -4,10 +4,10 @@
 /// if we had control over stack unwinding we could use that
 #[macro_export]
 macro_rules! stm_call {
-    ( $e:expr )     => ({
+    ( $l:expr, $e:expr )     => ({
         use $crate::StmResult::*;
 
-        let ret = $e.intern_run();
+        let ret = $e.intern_run($l);
         match ret {
             Success(s)  => s,
             Retry       => return Retry,
@@ -20,8 +20,8 @@ macro_rules! stm_call {
 /// declare a block that uses STM
 #[macro_export]
 macro_rules! stm {
-    ( $e:expr )    => {{
-        let func = || {
+    ( $l:ident, $e:expr )    => {{
+        let func = |$l: &mut _| {
             $crate::StmResult::Success($e)
         };
         $crate::STM::new(func)

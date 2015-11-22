@@ -100,6 +100,8 @@
 //! and every used var increases the chance of collisions. You should
 //! keep the amount of accessed variables as low as needed.
 
+extern crate crossbeam;
+
 #[macro_use]
 mod macros;
 
@@ -116,59 +118,55 @@ pub use var::Var;
 fn test_stm_macro() {
     let var = Var::new(0);
 
-    let stm = stm!({
-        var.write(42);
+    let stm = stm!(log, {
+        var.write(log, 42);
         0
     });
 
     stm.atomically();
 }
 
-
-
 #[test]
 fn test_stm_nested() {
     let var = Var::new(0);
 
-    let inner_stm = stm!(var.write(42));
-    let stm = stm!({
-        stm_call!(inner_stm);
-        var.read()
+    let inner_stm = stm!(log, var.write(log, 42));
+    let stm = stm!(log, {
+        stm_call!(log, inner_stm);
+        var.read(log)
     });
 
     assert_eq!(42, stm.atomically());
 }
 
-
 #[test]
 fn test_threaded() {
     use std::thread;
     use std::sync::mpsc::channel;
+    use std::sync::Arc;
+    use log::Log;
 
     let var = Var::new(0);
 
-    let (tx, rx) = channel();
 
-    let var_ref = var.clone();
-    thread::spawn(move || {
-        let stm = stm!({
-            let x = var_ref.read();
-            if x==0 {
-                stm_call!(retry());
-            }
-            x
+    let x = crossbeam::scope(|scope| {
+        let (tx, rx) = channel();
+        scope.spawn(|| {
+            let stm = STM::new(|log| {
+                let x = var.read(log);
+                if x == 0 {
+                    stm_call!(log, retry());
+                }
+                StmResult::Success(x)
+            });
+
+            let _ = tx.send(stm.atomically());
         });
 
-        let _ = tx.send(stm.atomically());
+        stm!(log, var.write(log, 42)).atomically();
+
+        rx.recv().unwrap()
     });
-
-    thread::sleep_ms(100);
-
-    stm!({
-        var.write(42);
-    }).atomically();
-
-    let x = rx.recv().unwrap();
 
     assert_eq!(42, x);
 }

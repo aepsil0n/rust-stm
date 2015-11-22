@@ -54,21 +54,21 @@ impl LogVar {
 ///
 /// used for checking vars to ensure atomicity
 #[derive(Clone)]
-pub struct Log {
+pub struct Log<'a> {
     /// map of all vars that map the `VarControlBlock` of a var to a LogVar
     ///
     /// the `VarControlBlock` is unique because it uses it's address for comparing
     ///
     /// the logs need to be accessed in a order because otherwise 
-    pub vars: BTreeMap<Arc<VarControlBlock>, LogVar>
+    pub vars: BTreeMap<&'a VarControlBlock, LogVar>
 }
 
-impl Log {
+impl<'a> Log<'a> {
     /// create a new Log
     ///
     /// normally you don't need to call this directly because the log
     /// is created as a thread-local global variable
-    pub fn new() -> Log {
+    pub fn new() -> Log<'a> {
         Log {
             vars: BTreeMap::new()
         }
@@ -85,10 +85,9 @@ impl Log {
     ///
     /// this is not always consistent with the current value of the var but may
     /// be an outdated or written but not commited value
-    pub fn read_var<T: Send+Sync+Any+Clone>(&mut self, var: &Var<T>) -> T {
-        let ctrl = var.control_block().clone();
+    pub fn read_var<T: Send+Sync+Any+Clone>(&mut self, var: &'a Var<T>) -> T {
         // check if the same var was written before
-        let value = match self.vars.entry(ctrl) {
+        let value = match self.vars.entry(var.control_block()) {
             // if the variable has been accessed before than load that value
             Occupied(entry)  => {
                 entry.get().get_val()
@@ -112,13 +111,12 @@ impl Log {
     ///
     /// does not immediately change the value but atomically
     /// commit all writes at the end of the computation
-    pub fn write_var<T: Any+Send+Sync+Clone>(&mut self, var: &Var<T>, value: T) {
+    pub fn write_var<T: Any+Send+Sync+Clone>(&mut self, var: &'a Var<T>, value: T) {
         // box the value
         let boxed = Arc::new(value);
 
-        let ctrl = var.control_block().clone();
         self.vars
-            .entry(ctrl)
+            .entry(var.control_block())
             .or_insert_with(LogVar::empty)
             .write = Some(boxed);
     }
@@ -129,7 +127,7 @@ impl Log {
     /// combine them into a single log to allow waiting for all reads
     ///
     /// needed for `STM::or`
-    pub fn combine_after_retry(&mut self, other: Log) {
+    pub fn combine_after_retry(&mut self, other: Log<'a>) {
         // combine the reads
         for (var, value) in other.vars {
             // if read then insert
@@ -155,8 +153,8 @@ impl Log {
 
 #[test]
 fn test_read() {
-    let mut log = Log::new();
     let var = Var::new(vec![1,2,3,4]);
+    let mut log = Log::new();
 
     // the variable can be read
     assert_eq!(&*log.read_var(&var), &[1,2,3,4]);
@@ -164,8 +162,8 @@ fn test_read() {
 
 #[test]
 fn test_write_read() {
-    let mut log = Log::new();
     let var = Var::new(vec![1,2]);
+    let mut log = Log::new();
 
     log.write_var(&var, vec![1,2,3,4]);
     // consecutive reads get the updated version
